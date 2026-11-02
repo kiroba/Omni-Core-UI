@@ -127,6 +127,7 @@ class OmniOta {
     final accept = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
+        scrollable: true,
         title: const Text('Update available'),
         content: Text('Omniverse $tag (build $latestBuild) is ready.\n'
             'You have build $currentBuild.\n\n'
@@ -148,6 +149,7 @@ class OmniOta {
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
+        scrollable: true,
         title: const Text('Updating'),
         content: ValueListenableBuilder<String>(
           valueListenable: progress,
