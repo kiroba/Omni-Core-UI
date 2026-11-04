@@ -11,4 +11,5 @@ export 'src/local_event_store.dart';
 export 'src/omni_hub_client.dart';
 export 'src/hub_feed.dart';
 export 'src/omni_ota_engine.dart';
+export 'src/ota_download.dart';
 export 'src/human_badges.dart';
