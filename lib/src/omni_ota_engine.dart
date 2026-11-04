@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:ota_update/ota_update.dart';
 
 import 'canonical_json.dart';
+import 'ota_download.dart';
 import 'stargate_identity.dart';
 
 /// ============================================================================
@@ -145,6 +146,16 @@ class OmniOta {
 
   static void _runUpdate(BuildContext context, String url, String? sha256) {
     final progress = ValueNotifier<String>('Starting download...');
+    final downloader = OtaDownloader();
+    LoopbackFileServer? local;
+    var closed = false;
+    void finish() {
+      closed = true;
+      downloader.cancel();
+      OtaUpdate().cancel();
+      local?.close();
+    }
+
     showDialog<void>(
       context: context,
       barrierDismissible: false,
@@ -158,7 +169,7 @@ class OmniOta {
         actions: [
           TextButton(
             onPressed: () {
-              OtaUpdate().cancel();
+              finish();
               Navigator.pop(ctx);
             },
             child: const Text('Close'),
@@ -167,36 +178,74 @@ class OmniOta {
       ),
     );
 
-    try {
-      OtaUpdate()
-          .execute(
-            url,
-            destinationFilename: '$appSlug-update.apk',
-            sha256checksum: (sha256 == null || sha256.isEmpty) ? null : sha256,
-          )
-          .listen(
-        (OtaEvent event) {
-          switch (event.status) {
-            case OtaStatus.DOWNLOADING:
-              progress.value = 'Downloading... ${event.value ?? 0}%';
-              break;
-            case OtaStatus.INSTALLING:
-              progress.value = 'Verified. Opening the Android installer...';
-              break;
-            case OtaStatus.CHECKSUM_ERROR:
-              progress.value = 'Checksum mismatch: the download was rejected.';
-              break;
-            case OtaStatus.PERMISSION_NOT_GRANTED_ERROR:
-              progress.value = 'Allow "Install unknown apps" for this app, then try again.';
-              break;
-            default:
-              progress.value = 'Update stopped: ${event.status.name}${event.value == null ? '' : ' (${event.value})'}';
-          }
-        },
-        onError: (Object e) => progress.value = 'Update failed: $e',
-      );
-    } catch (e) {
-      progress.value = 'Update failed: $e';
-    }
+    // 1) Download in Dart: long idle timeout, retries that resume, SHA-256 check.
+    // 2) Hand the verified file to the installer plugin from 127.0.0.1, so its
+    //    fixed 10 s network timeout never meets the internet.
+    () async {
+      try {
+        final dir = await Directory.systemTemp.createTemp('omni_ota');
+        final file = File('${dir.path}/$appSlug-update.apk');
+        await downloader.download(
+          Uri.parse(url),
+          file,
+          sha256: sha256,
+          onProgress: (got, total, attempt) {
+            if (closed) return;
+            final pct = total == null || total == 0
+                ? ''
+                : ' ${(got * 100 ~/ total)}%';
+            final mb = (got / 1048576).toStringAsFixed(1);
+            progress.value =
+                'Downloading...$pct ($mb MB)${attempt > 1 ? '\nSlow connection: try $attempt of ${downloader.maxAttempts}' : ''}';
+          },
+        );
+        if (closed) return;
+        progress.value =
+            'Downloaded and checked. Opening the Android installer...';
+        local = await LoopbackFileServer.serve(file, '$appSlug-update.apk');
+        OtaUpdate()
+            .execute(
+              local!.url.toString(),
+              destinationFilename: '$appSlug-update.apk',
+              sha256checksum: (sha256 == null || sha256.isEmpty)
+                  ? null
+                  : sha256,
+            )
+            .listen(
+              (OtaEvent event) {
+                if (closed) return;
+                switch (event.status) {
+                  case OtaStatus.DOWNLOADING:
+                    break; // local copy, instant
+                  case OtaStatus.INSTALLING:
+                    progress.value =
+                        'Verified. Opening the Android installer...';
+                    break;
+                  case OtaStatus.CHECKSUM_ERROR:
+                    progress.value =
+                        'Checksum mismatch: the download was rejected.';
+                    break;
+                  case OtaStatus.PERMISSION_NOT_GRANTED_ERROR:
+                    progress.value = 'Allow "Install unknown apps" for this app, then try again.';
+                    break;
+                  default:
+                    progress.value =
+                        'Update stopped: ${event.status.name}${event.value == null ? '' : ' (${event.value})'}';
+                }
+              },
+              onError: (Object e) {
+                if (!closed) progress.value = 'Update failed: $e';
+              },
+            );
+      } on OtaDownloadException catch (e) {
+        if (!closed) {
+          progress.value =
+              'Could not download the update ($e). '
+              'Check your connection and tap Update again, or get it from the tester page.';
+        }
+      } catch (e) {
+        if (!closed) progress.value = 'Update failed: $e';
+      }
+    }();
   }
 }
