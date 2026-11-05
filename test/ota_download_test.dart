@@ -208,4 +208,52 @@ void main() {
       await srv.close();
     },
   );
+
+  test('extra headers go to the URL host only, never along a redirect to another host', () async {
+    final seen = <String, String?>{};
+    late HttpServer other;
+    other = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    other.listen((req) async {
+      seen['other'] = req.headers.value('X-Omni-Local-Token');
+      req.response.contentLength = data.length;
+      req.response.add(data);
+      await req.response.close();
+    });
+    final s = await _server((req, _) async {
+      seen['first'] = req.headers.value('X-Omni-Local-Token');
+      req.response
+        ..statusCode = 302
+        ..headers.set(HttpHeaders.locationHeader, 'http://localhost:${other.port}/cdn.apk');
+      await req.response.close();
+    });
+    final f = await _fast().download(Uri.parse('http://127.0.0.1:${s.port}/a'), File('${tmp.path}/h.apk'),
+        sha256: sum, headers: {'X-Omni-Local-Token': 'secret'});
+    expect(await f.readAsBytes(), data);
+    expect(seen['first'], 'secret');
+    expect(seen['other'], isNull);
+    await s.close(force: true);
+    await other.close(force: true);
+  });
+
+  test('retryChecksumMismatch: false fails at once on a bad hash', () async {
+    var hits = 0;
+    final s = await _server((req, _) async {
+      hits++;
+      req.response.add(data);
+      await req.response.close();
+    });
+    final d = OtaDownloader(
+      connectTimeout: const Duration(seconds: 2),
+      idleTimeout: const Duration(milliseconds: 400),
+      maxAttempts: 4,
+      backoff: (_) => const Duration(milliseconds: 10),
+      retryChecksumMismatch: false,
+    );
+    await expectLater(
+      d.download(Uri.parse('http://127.0.0.1:${s.port}/x.apk'), File('${tmp.path}/m.apk'), sha256: 'ab' * 32),
+      throwsA(isA<OtaDownloadException>().having((e) => '$e', 'msg', 'checksum mismatch')),
+    );
+    expect(hits, 1);
+    await s.close(force: true);
+  });
 }

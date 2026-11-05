@@ -1,12 +1,11 @@
-import 'dart:convert';
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:ota_update/ota_update.dart';
 
-import 'canonical_json.dart';
 import 'ota_download.dart';
-import 'stargate_identity.dart';
+import 'ota_sources.dart';
 
 /// ============================================================================
 /// OMNI OTA ENGINE (omni_core_ui)
@@ -30,9 +29,14 @@ import 'stargate_identity.dart';
 /// any manifest that isn't signed by it. That matters most once peers serve
 /// updates over OmniNet, since a peer is not trusted the way GitHub is.
 ///
-/// OmniNet: once the mesh transport is live, peers will serve the same manifest
-/// and APK bytes and become the primary source; GitHub stays as the fallback.
-/// Add those sources to [OmniOta.manifestSources] ahead of GitHub.
+/// Local Node first (0.1.3): Omni-Daemon v8.30.0+ keeps a verified copy of the
+/// manifest and the files, shared between paired devices. The app asks the Node
+/// on 127.0.0.1:5000 first and GitHub at the same time; the Node's manifest is
+/// used only if its signature verifies against [otaPubkey] (never unsigned) and
+/// it isn't older than GitHub's. The file comes from the Node by SHA-256 when it
+/// can, else from GitHub. Omni Node needs its local token: apps hand it over
+/// with [OmniOta.localTokenProvider] (or `localToken:` on [checkAndPrompt]).
+/// Details: ota_sources.dart, and Omni-Daemon Admin/docs/PEER_UPDATES.md.
 /// ============================================================================
 
 class OmniOta {
@@ -42,8 +46,8 @@ class OmniOta {
   /// This build's number (1000 + release workflow run). 0 = local dev build.
   static const int currentBuild = int.fromEnvironment('OMNI_BUILD', defaultValue: 0);
 
-  /// Where to look for the manifest, in priority order.
-  /// OmniNet peer sources go first here once the mesh transport exists.
+  /// GitHub manifest URLs, in priority order (the Node is asked at
+  /// [nodeManifestUrl] ahead of these, see [localNodeFirst]).
   static const List<String> manifestSources = [
     'https://github.com/kiroba/The-Omniverse/releases/latest/download/update-manifest.json',
   ];
@@ -52,40 +56,61 @@ class OmniOta {
   /// manifests accepted (HTTPS + SHA-256 only).
   static const String otaPubkey = String.fromEnvironment('OMNI_OTA_PUBKEY', defaultValue: '');
 
+  /// The Omni Node's loopback manifest (daemon v8.30.0+).
+  static const String nodeManifestUrl = 'http://127.0.0.1:5000/api/updates/manifest';
+
+  /// The Omni Node's file endpoint; the file's SHA-256 is appended.
+  static const String nodeFileUrlBase = 'http://127.0.0.1:5000/api/updates/file/';
+
+  /// Ask the local Omni Node before GitHub (default on). Set false to go
+  /// straight to GitHub as in 0.1.2.
+  static bool localNodeFirst = true;
+
+  /// Returns the Omni Node local token (Omni Node > Connect apps), or null when
+  /// the app has none. Default: none, so on a Node that requires the token
+  /// (Omni Node always does) the Node answers 401 and GitHub is used. Apps that
+  /// already keep the token set this once, e.g.
+  /// `OmniOta.localTokenProvider = () => node.token;`.
+  static FutureOr<String?> Function()? localTokenProvider;
+
+  /// Where the last manifest and the last download came from (null before).
+  static OtaSource? get lastManifestSource => _lastManifest?.source;
+  static OtaSource? get lastDownloadSource => _lastDownloadSource;
+
   static bool _checkedThisSession = false;
+  static OtaManifestResult? _lastManifest;
+  static OtaSource? _lastDownloadSource;
 
   /// True when the manifest's signature checks out, or no key is pinned.
-  static Future<bool> manifestTrusted(Map<String, dynamic> manifest) async {
-    if (otaPubkey.isEmpty) return true;
-    final sig = manifest['signature'];
-    if (sig is! String) return false;
-    final unsigned = Map<String, dynamic>.from(manifest)..remove('signature');
-    return StargateIdentity.verifyBytes(utf8.encode(canonicalJson(unsigned)), sig, otaPubkey);
-  }
+  static Future<bool> manifestTrusted(Map<String, dynamic> manifest) =>
+      OtaSourceResolver.isTrusted(manifest, otaPubkey);
 
-  /// Fetches the first manifest that answers. Returns null if none do.
-  static Future<Map<String, dynamic>?> fetchManifest() async {
-    for (final src in manifestSources) {
-      final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
-      try {
-        final req = await client.getUrl(Uri.parse(src));
-        final res = await req.close().timeout(const Duration(seconds: 10));
-        if (res.statusCode != 200) continue;
-        final body = await res.transform(utf8.decoder).join();
-        final decoded = jsonDecode(body);
-        if (decoded is Map<String, dynamic> && await manifestTrusted(decoded)) return decoded;
-      } catch (_) {
-        // try the next source
-      } finally {
-        client.close(force: true);
-      }
-    }
-    return null;
+  static OtaSourceResolver _resolver(String? localToken) => OtaSourceResolver(
+        nodeManifestUrl: Uri.parse(nodeManifestUrl),
+        nodeFileBase: nodeFileUrlBase,
+        githubManifestUrls: [for (final s in manifestSources) Uri.parse(s)],
+        pubkeyHex: otaPubkey,
+        tokenProvider: (localToken != null && localToken.trim().isNotEmpty)
+            ? () => localToken
+            : localTokenProvider,
+        useNode: localNodeFirst,
+        log: (m) => debugPrint('[omni_ota] $m'),
+      );
+
+  /// The manifest to use: the local Omni Node's when it is signed and not older
+  /// than GitHub's, else GitHub's. Returns null if neither answers with one this
+  /// build trusts. [localToken] overrides [localTokenProvider].
+  static Future<Map<String, dynamic>?> fetchManifest({String? localToken}) async {
+    final r = await _resolver(localToken).resolveManifest();
+    _lastManifest = r;
+    return r?.manifest;
   }
 
   /// Checks for an update and, if one exists, asks the user to install it.
   /// [silent]: no message when already up to date or offline (use on startup).
-  static Future<void> checkAndPrompt(BuildContext context, {bool silent = false}) async {
+  /// [localToken]: the Omni Node local token, if the caller has it at hand
+  /// (otherwise [localTokenProvider] is asked).
+  static Future<void> checkAndPrompt(BuildContext context, {bool silent = false, String? localToken}) async {
     if (silent && _checkedThisSession) return;
     _checkedThisSession = true;
 
@@ -101,7 +126,8 @@ class OmniOta {
     }
 
     final messenger = ScaffoldMessenger.maybeOf(context);
-    final manifest = await fetchManifest();
+    final manifest = await fetchManifest(localToken: localToken);
+    final fromNode = _lastManifest?.nodeUsable ?? false;
     if (manifest == null) {
       if (!silent) messenger?.showSnackBar(const SnackBar(content: Text('Could not reach the update server.')));
       return;
@@ -131,7 +157,8 @@ class OmniOta {
         scrollable: true,
         title: const Text('Update available'),
         content: Text('Omniverse $tag (build $latestBuild) is ready.\n'
-            'You have build $currentBuild.\n\n'
+            'You have build $currentBuild.\n'
+            'Found via ${(_lastManifest?.source ?? OtaSource.github).label}.\n\n'
             'It downloads, gets checked (SHA-256), then Android asks you to install.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Later')),
@@ -141,17 +168,24 @@ class OmniOta {
     );
     if (accept != true || !context.mounted) return;
 
-    _runUpdate(context, '${entry['url']}', entry['sha256']?.toString());
+    _runUpdate(context, '${entry['url']}', entry['sha256']?.toString(),
+        tryNode: fromNode, localToken: localToken);
   }
 
-  static void _runUpdate(BuildContext context, String url, String? sha256) {
+  static void _runUpdate(BuildContext context, String url, String? sha256,
+      {bool tryNode = false, String? localToken}) {
     final progress = ValueNotifier<String>('Starting download...');
-    final downloader = OtaDownloader();
+    final resolver = _resolver(localToken);
+    final maxTries = {
+      OtaSource.node: resolver.nodeDownloaderFactory().maxAttempts,
+      OtaSource.github: resolver.githubDownloaderFactory().maxAttempts,
+    };
+    var source = OtaSource.github;
     LoopbackFileServer? local;
     var closed = false;
     void finish() {
       closed = true;
-      downloader.cancel();
+      resolver.cancel();
       OtaUpdate().cancel();
       local?.close();
     }
@@ -185,10 +219,15 @@ class OmniOta {
       try {
         final dir = await Directory.systemTemp.createTemp('omni_ota');
         final file = File('${dir.path}/$appSlug-update.apk');
-        await downloader.download(
-          Uri.parse(url),
-          file,
+        final result = await resolver.download(
+          githubUrl: url,
+          dest: file,
           sha256: sha256,
+          tryNode: tryNode,
+          onSource: (s) {
+            source = s;
+            if (!closed) progress.value = 'Downloading from ${s.label}...';
+          },
           onProgress: (got, total, attempt) {
             if (closed) return;
             final pct = total == null || total == 0
@@ -196,12 +235,13 @@ class OmniOta {
                 : ' ${(got * 100 ~/ total)}%';
             final mb = (got / 1048576).toStringAsFixed(1);
             progress.value =
-                'Downloading...$pct ($mb MB)${attempt > 1 ? '\nSlow connection: try $attempt of ${downloader.maxAttempts}' : ''}';
+                'Downloading from ${source.label}...$pct ($mb MB)${attempt > 1 ? '\nSlow connection: try $attempt of ${maxTries[source]}' : ''}';
           },
         );
+        _lastDownloadSource = result.source;
         if (closed) return;
         progress.value =
-            'Downloaded and checked. Opening the Android installer...';
+            'Downloaded from ${result.source.label} and checked. Opening the Android installer...';
         local = await LoopbackFileServer.serve(file, '$appSlug-update.apk');
         OtaUpdate()
             .execute(
