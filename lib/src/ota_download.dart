@@ -22,7 +22,11 @@ import 'package:crypto/crypto.dart';
 /// * 4xx answers (missing asset, bad link) fail at once: retrying can't help.
 ///
 /// The source URL is any http(s) URL, so OmniNet peers that serve the same bytes
-/// can use this downloader too; the SHA-256 is what makes a peer safe.
+/// can use this downloader too; the SHA-256 is what makes a peer safe. Since
+/// 0.1.3 the local Omni Node (`/api/updates/file/<sha256>`) is tried first; see
+/// `OtaSourceResolver` in ota_sources.dart. [download] takes extra [headers]
+/// (the Node's local token), sent only to the URL's own host and port, never
+/// along a redirect to another server.
 /// ============================================================================
 
 typedef OtaProgress = void Function(int received, int? total, int attempt);
@@ -46,12 +50,18 @@ class OtaDownloader {
   final Duration Function(int failedAttempts) backoff;
   final int maxRedirects;
 
+  /// Whether a checksum mismatch counts as a retryable failure (default, as in
+  /// 0.1.2). The Node source turns it off so a bad copy falls straight through
+  /// to GitHub instead of being downloaded again.
+  final bool retryChecksumMismatch;
+
   OtaDownloader({
     this.connectTimeout = const Duration(seconds: 30),
     this.idleTimeout = const Duration(seconds: 45),
     this.maxAttempts = 5,
     Duration Function(int failedAttempts)? backoff,
     this.maxRedirects = 6,
+    this.retryChecksumMismatch = true,
   }) : backoff = backoff ?? ((n) => Duration(seconds: min(2 * n, 10)));
 
   bool _cancelled = false;
@@ -70,6 +80,7 @@ class OtaDownloader {
     File dest, {
     String? sha256,
     OtaProgress? onProgress,
+    Map<String, String>? headers,
   }) async {
     final want = (sha256 ?? '').trim().toLowerCase();
     if (await dest.exists()) await dest.delete();
@@ -77,12 +88,15 @@ class OtaDownloader {
     for (var attempt = 1; attempt <= maxAttempts; attempt++) {
       if (_cancelled) throw OtaDownloadException('cancelled', retryable: false);
       try {
-        await _attempt(url, dest, attempt, onProgress);
+        await _attempt(url, dest, attempt, onProgress, headers);
         if (want.isNotEmpty) {
           final got = (await _sha256Of(dest)).toLowerCase();
           if (got != want) {
             await dest.delete();
-            throw OtaDownloadException('checksum mismatch');
+            throw OtaDownloadException(
+              'checksum mismatch',
+              retryable: retryChecksumMismatch,
+            );
           }
         }
         return dest;
@@ -108,6 +122,7 @@ class OtaDownloader {
     File dest,
     int attempt,
     OtaProgress? onProgress,
+    Map<String, String>? headers,
   ) async {
     final client = HttpClient()
       ..connectionTimeout = connectTimeout
@@ -121,6 +136,12 @@ class OtaDownloader {
       for (var hop = 0; hop <= maxRedirects; hop++) {
         final req = await client.getUrl(target).timeout(connectTimeout);
         req.followRedirects = false;
+        if (headers != null &&
+            target.host == url.host &&
+            target.port == url.port &&
+            target.scheme == url.scheme) {
+          headers.forEach(req.headers.set);
+        }
         if (have > 0) req.headers.set(HttpHeaders.rangeHeader, 'bytes=$have-');
         final r = await req.close().timeout(idleTimeout);
         if (r.isRedirect) {
