@@ -231,6 +231,9 @@ class OtaSourceResolver {
     final client = HttpClient()
       ..connectionTimeout = connect
       ..userAgent = 'omni-ota/1';
+    if (url.host == '127.0.0.1' || url.host == 'localhost' || url.host == '::1') {
+      client.findProxy = (_) => 'DIRECT'; // the Node is never behind a proxy
+    }
     try {
       final req = await client.getUrl(url).timeout(connect);
       headers?.forEach(req.headers.set);

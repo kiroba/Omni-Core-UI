@@ -128,6 +128,8 @@ class OtaDownloader {
       ..connectionTimeout = connectTimeout
       ..idleTimeout = const Duration(seconds: 5)
       ..userAgent = 'omni-ota/1';
+    // Loopback (the Omni Node) never goes through a proxy from the environment.
+    if (_isLoopback(url.host)) client.findProxy = (_) => 'DIRECT';
     _client = client;
     try {
       final have = await dest.exists() ? await dest.length() : 0;
@@ -202,6 +204,9 @@ class OtaDownloader {
       if (identical(_client, client)) _client = null;
     }
   }
+
+  static bool _isLoopback(String host) =>
+      host == '127.0.0.1' || host == 'localhost' || host == '::1';
 
   static Future<String> _sha256Of(File f) async =>
       (await sha256.bind(f.openRead()).first).toString();
