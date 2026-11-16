@@ -16,6 +16,10 @@ Shared core for every Omniverse app. Built from the Gemini "Omni-Hub bundling" b
 - Android always shows the install prompt for sideloaded updates. Flutter release builds can't hot-swap Dart code, so a "patch without restart" can only change assets or config.
 - Signed manifests turn on when the repo secret `OMNI_OTA_SIGNING_KEY` (64-hex Ed25519 private seed) is set. Until then, manifests rely on HTTPS + SHA-256.
 
+## Roadmap (Nov 30, 2026 cycle)
+
+Two finalized tracks start here, in this order: (1) the **split-package migration** — Omni-Core-UI migrates first, then the apps, one CI-verified PR each (shelved until Nov 30 by design; Flutter 3.50 formalised the deprecations); (2) **envelope encryption S1**, which builds on the migrated package.
+
 ## Tests
 `test/ota_download_test.dart` and `test/ota_sources_test.dart` are pure Dart (fake Omni Node + fake GitHub on loopback); they also run outside Flutter with `package:test`.
 
