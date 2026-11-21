@@ -9,6 +9,7 @@ export 'src/canonical_json.dart';
 export 'src/stargate_identity.dart';
 export 'src/local_event_store.dart';
 export 'src/omni_hub_client.dart';
+export 'src/omni_node_wiring.dart';
 export 'src/hub_feed.dart';
 export 'src/omni_ota_engine.dart';
 export 'src/ota_download.dart';
