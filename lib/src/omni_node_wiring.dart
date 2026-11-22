@@ -5,15 +5,22 @@
 /// app imports, instead of a copy per app.
 ///
 /// What this is: one door out of the app, in two modes.
-/// - Delegate: a node answered the loopback probe, so the node sequences,
-///   signs, stores and relays. The app hands it action + payload ONLY —
-///   the daemon chains at append inside its write lock (sets previous_hash
-///   itself, signs with the node key; POST /api/events/append returns
-///   event_id + merkle_hash). No local chain, no client-supplied
-///   previous_hash, no sequence field: ordering IS previous_hash
-///   (SoT §15 ruling, Nov 20, 2026).
+/// - Delegate: a node answered the loopback probe. How events actually
+///   travel on the shipped path (KickBack, ruled Option A, SoT §16): the
+///   app person-signs each event into its own on-device log, then syncs —
+///   the signed envelope rides INSIDE the payload, and the node re-signs
+///   as itself and relays. [appendToNode] is the raw delegate verb for
+///   callers that do not person-sign: it hands the node action + payload
+///   only, and the node authors the event itself.
 /// - Standalone: no node answered. The app signs into its own on-device
 ///   log (LocalEventStore) and syncs to a hub when one appears.
+///
+/// Either way the §15 rule binds at the TOP LEVEL of the append body: no
+/// top-level previous_hash, no sequence, no app_context. The daemon
+/// chains at append inside its write lock (sets previous_hash itself,
+/// signs with the node key; POST /api/events/append returns event_id +
+/// merkle_hash). No local chain, no client-supplied previous_hash, no
+/// sequence field: ordering IS previous_hash (SoT §15, Nov 20, 2026).
 ///
 /// appContext is LOCAL ONLY: it names the app for this device's own
 /// filtering and logging. It is never serialized into an envelope or an
